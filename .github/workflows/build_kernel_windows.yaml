@@ -12,33 +12,77 @@ jobs:
     strategy:
       matrix:
         os: [ windows-2022 ]
-        python: [ 3.12 ]
-        torch: [
-#          { version: '2.9.1', cuda: '12.6.3', wheel: '126' },
-          { version: '2.9.1', cuda: '12.8.1', wheel: '128' },
-#          { version: '2.9.1', cuda: '13.0.1', wheel: '130' }
-        ]
+        python: [ '3.12', '3.13' ]
+        backend:
+          - type: 'cuda'
+            torch_version: '2.8'
+            cuda_version: '12.9.1'
+            install_cmd: 'pip install torch --index-url https://download.pytorch.org/whl/cu129'
+          - type: 'xpu'
+            torch_version: '2.9.0'
+            oneapi_version: '2025.2.1'
+            install_cmd: 'pip install torch==2.9.0 pytorch-triton-xpu==3.5.0 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/test/xpu'
 
-    name: Build kernel
+    name: Build kernel - ${{ matrix.backend.type }} - Python ${{ matrix.python }}
     runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/cache@v4
+        if: matrix.backend.type == 'cuda'
         with:
-          key: cuda-toolkit-v${{ matrix.cuda }}-${{ matrix.os }}
+          key: cuda-toolkit-v${{ matrix.backend.cuda_version }}-${{ matrix.os }}
           path: |
             C:\Program Files\NVIDIA GPU Computing Toolkit
             ~/.cargo/registry
             ~/.cargo/git
 
+      - uses: actions/cache@v4
+        if: matrix.backend.type == 'xpu'
+        with:
+          key: oneapi-toolkit-v${{ matrix.backend.oneapi_version }}-${{ matrix.os }}
+          path: |
+            C:\Program Files (x86)\Intel\oneAPI
+            ~/.cargo/registry
+            ~/.cargo/git
+
       - uses: actions/checkout@v5
 
-      # CUDA environment setup
-      - uses: Jimver/cuda-toolkit@v0.2.29
+      # Intel oneAPI environment setup (for XPU builds)
+      - name: Install Intel oneAPI Base Toolkit
+        if: matrix.backend.type == 'xpu'
+        shell: powershell
+        run: |
+          $url = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/7991f8c6-8ac0-44e9-afb7-53f6e1a3f9e5/w_BaseKit_p_2025.2.1.1264_offline.exe"
+          $installer = "$env:TEMP\oneapi_installer.exe"
+          Write-Host "Downloading Intel oneAPI Base Toolkit ${{ matrix.backend.oneapi_version }}..."
+          Start-BitsTransfer -Source $url -Destination $installer -Description "Downloading oneAPI" -DisplayName "Intel oneAPI Installer"
+          Write-Host "Installing Intel oneAPI Base Toolkit..."
+          Start-Process -FilePath $installer -ArgumentList "-s", "-a", "--silent", "--eula", "accept" -Wait -NoNewWindow
+          if ($LASTEXITCODE -ne 0) {
+            throw "Intel oneAPI installation failed with exit code $LASTEXITCODE"
+          }
+          Remove-Item $installer -ErrorAction SilentlyContinue
+          Write-Host "Intel oneAPI Base Toolkit installed successfully"
+      
+      - name: Verify Intel oneAPI installation
+        if: matrix.backend.type == 'xpu'
+        shell: powershell
+        run: |
+          & "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64
+          if (Get-Command icx -ErrorAction SilentlyContinue) {
+            icx --version
+          } else {
+            throw "Intel oneAPI compiler 'icx' not found in PATH"
+          }
+
+      # CUDA environment setup (for CUDA builds)
+      - uses: N-Storm/cuda-toolkit@v0.2.28
+        if: matrix.backend.type == 'cuda'
         id: setup-cuda-toolkit
         with:
-          cuda: ${{ matrix.torch.cuda }}  # TODO(mfuntowicz): How can we test multiple CUDA versions than align with torch?
+          cuda: ${{ matrix.backend.cuda_version }}
       - name: "NVCC checks"
+        if: matrix.backend.type == 'cuda'
         run: nvcc -V
 
       # Rust build environment setup
@@ -57,20 +101,33 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: 'pip'
 
-      - name: Install PyTorch
-        run: pip install torch --index-url https://download.pytorch.org/whl/cu${{ matrix.torch.wheel }}
+      - name: Install PyTorch (${{ matrix.backend.type }})
+        run: ${{ matrix.backend.install_cmd }}
+
+      - name: Build activation kernel
+        if: matrix.backend.type == 'cuda'
+        run: ( scripts\windows\builder.ps1 -SourceFolder examples/activation -BuildConfig Release -Backend cuda -Build -Force )
+#      - name: Copy activation kernel
+#        run: cp -rL examples/activation/build activation-kernel
 
       - name: Build cutlass GEMM kernel
+        if: matrix.backend.type == 'cuda'
         run: ( scripts\windows\builder.ps1 -SourceFolder examples/cutlass-gemm -BuildConfig Release -Backend cuda -Build -Force )
 #      - name: Copy cutlass GEMM kernel
 #        run: cp -rL examples/cutlass-gemm/result cutlass-gemm-kernel
 
-      - name: Build relu kernel
+      - name: Build relu kernel (CUDA)
+        if: matrix.backend.type == 'cuda'
         run: ( scripts\windows\builder.ps1 -SourceFolder examples/relu -BuildConfig Release -Backend cuda -Build -Force )
 #      - name: Copy relu kernel
 #        run: cp -rL examples/relu/result relu-kernel
 
+      - name: Build relu kernel (XPU)
+        if: matrix.backend.type == 'xpu'
+        run: ( scripts\windows\builder.ps1 -SourceFolder examples/relu -BuildConfig Release -Backend xpu -Build -Force )
+
       - name: Build relu-backprop-compile kernel
+        if: matrix.backend.type == 'cuda'
         run: ( scripts\windows\builder.ps1 -SourceFolder examples/relu-backprop-compile -BuildConfig Release -Backend cuda -Build -Force  )
 #      - name: Copy relu-backprop-compile kernel
 #        run: cp -rL examples/relu-backprop-compile/result relu-backprop-compile-kernel
@@ -80,4 +137,5 @@ jobs:
 #        run: ( cd examples/relu-specific-torch && nix build . )
 
       - name: Build silu-and-mul-universal kernel
+        if: matrix.backend.type == 'cuda'
         run: ( scripts\windows\builder.ps1 -SourceFolder examples/silu-and-mul-universal -BuildConfig Release -Build -Force)
